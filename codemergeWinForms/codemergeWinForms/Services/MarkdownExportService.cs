@@ -61,13 +61,15 @@ namespace codemergeWinForms.Services
         /// <summary>
         /// Construit le contenu Markdown complet d'un projet et retourne le nom de fichier cible.
         /// </summary>
-        public async Task<(string FileName, string Markdown)> BuildProjectExportAsync(
+        public async Task<(string PackageDirectoryPath, string MarkdownFilePath)> ExportProjectAsync(
             string projectId,
             string branch,
             List<string> selectedFiles,
+            string outputDirectory,
             DateTime now)
         {
             ArgumentNullException.ThrowIfNull(selectedFiles);
+            ArgumentException.ThrowIfNullOrWhiteSpace(outputDirectory);
 
             var (projectName, projectWebUrl) = await _repositoryService.GetProjectMetadataAsync(projectId);
             var repositoryItems = await _repositoryService.GetRepositoryTreeAsync(projectId, branch);
@@ -77,7 +79,11 @@ namespace codemergeWinForms.Services
             string safeProjectName = SanitizeFileNamePart(projectName);
             string safeBranch = SanitizeFileNamePart(branch);
             string fileName = $"{timestamp} {safeProjectName} [{safeBranch}].md";
-            string assetFolderName = Path.GetFileNameWithoutExtension(fileName);
+            const string assetFolderName = "assets";
+            string packageDirectoryName = Path.GetFileNameWithoutExtension(fileName);
+            string packageDirectoryPath = GetUniqueDirectoryPath(outputDirectory, packageDirectoryName);
+
+            Directory.CreateDirectory(packageDirectoryPath);
 
             var fileContents = new Dictionary<string, string>();
             var fileFunctions = new Dictionary<string, List<FunctionEntry>>();
@@ -96,7 +102,7 @@ namespace codemergeWinForms.Services
 
                 if (FileTypeHelper.IsImageFile(file))
                 {
-                    await CopyAssetAsync(projectId, branch, file, assetFolderName);
+                    await CopyAssetAsync(projectId, branch, file, packageDirectoryPath, assetFolderName);
                     imageFiles.Add(file);
                     fileFunctions[file] = new List<FunctionEntry>();
                     exportedFiles.Add(file);
@@ -105,7 +111,7 @@ namespace codemergeWinForms.Services
 
                 if (FileTypeHelper.IsPdfFile(file))
                 {
-                    await CopyAssetAsync(projectId, branch, file, assetFolderName);
+                    await CopyAssetAsync(projectId, branch, file, packageDirectoryPath, assetFolderName);
                     pdfFiles.Add(file);
                     fileFunctions[file] = new List<FunctionEntry>();
                     exportedFiles.Add(file);
@@ -213,7 +219,9 @@ namespace codemergeWinForms.Services
                 }
             }
 
-            return (fileName, sb.ToString());
+            var markdownFilePath = Path.Combine(packageDirectoryPath, fileName);
+            await File.WriteAllTextAsync(markdownFilePath, sb.ToString(), new UTF8Encoding(false));
+            return (packageDirectoryPath, markdownFilePath);
         }
 
         /// <summary>
@@ -533,18 +541,42 @@ namespace codemergeWinForms.Services
             return TrimBom(Encoding.Latin1.GetString(bytes));
         }
 
-        private async Task CopyAssetAsync(string projectId, string branch, string file, string assetFolderName)
+        private async Task CopyAssetAsync(
+            string projectId,
+            string branch,
+            string file,
+            string packageDirectoryPath,
+            string assetFolderName)
         {
-            Directory.CreateDirectory(assetFolderName);
-
             var bytes = await _repositoryService.GetFileBytesAsync(projectId, file, branch);
-            var outputAssetPath = Path.Combine(assetFolderName, file.Replace('/', Path.DirectorySeparatorChar));
+            var assetRootPath = Path.Combine(packageDirectoryPath, assetFolderName);
+            var outputAssetPath = Path.Combine(assetRootPath, file.Replace('/', Path.DirectorySeparatorChar));
             var outputDirectory = Path.GetDirectoryName(outputAssetPath);
 
             if (!string.IsNullOrWhiteSpace(outputDirectory))
                 Directory.CreateDirectory(outputDirectory);
 
             await File.WriteAllBytesAsync(outputAssetPath, bytes);
+        }
+
+        private static string GetUniqueDirectoryPath(string parentDirectory, string baseDirectoryName)
+        {
+            var candidate = Path.Combine(parentDirectory, baseDirectoryName);
+
+            if (!Directory.Exists(candidate))
+                return candidate;
+
+            var suffix = 2;
+
+            while (true)
+            {
+                candidate = Path.Combine(parentDirectory, $"{baseDirectoryName} ({suffix})");
+
+                if (!Directory.Exists(candidate))
+                    return candidate;
+
+                suffix++;
+            }
         }
 
         private static bool IsRootReadmeFile(string path)

@@ -3,6 +3,9 @@ using codemergeWinForms.Services;
 using codemergeWinForms.Services.FunctionExtraction;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO.Compression;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
 
@@ -17,10 +20,23 @@ namespace codemergeWinForms
         private const long LargeUnknownFileThresholdBytes = 1_048_576;
         private const int FileSizeFetchConcurrency = 8;
         private const int UnknownFileAnalysisConcurrency = 4;
+        private const string ApplicationDataFolderName = "CodeMerge";
+        private const string LastTokenFileName = "lastToken.txt";
+        private const string LastProjectIdFileName = "lastId.txt";
+        private const string LastBranchFileName = "lastBranch.txt";
+        private const string LastOutputDirectoryFileName = "lastOutputDirectory.txt";
+        private static readonly Guid DownloadsFolderId = new("374DE290-123F-4565-9164-39C4925E467B");
 
         private bool _isPropagatingChecks;
         private ContextMenuStrip? _exportResultMenu;
         private ExportResultItem? _selectedExportResult;
+
+        [DllImport("shell32.dll")]
+        private static extern int SHGetKnownFolderPath(
+            [MarshalAs(UnmanagedType.LPStruct)] Guid rfid,
+            uint dwFlags,
+            nint hToken,
+            out nint ppszPath);
 
         private readonly List<string> typeGit = new();
 
@@ -87,6 +103,7 @@ namespace codemergeWinForms
         public Form1()
         {
             InitializeComponent();
+            tbxOutputDirectory.Text = GetDefaultOutputDirectory();
             LoadLastSessionValuesIfAvailable();
             trvTree.BeforeCheck += trvTree_BeforeCheck;
             trvTree.AfterCheck += trvTree_AfterCheck;
@@ -287,6 +304,14 @@ namespace codemergeWinForms
                 return;
             }
 
+            var outputDirectory = GetSelectedOutputDirectory();
+
+            if (string.IsNullOrWhiteSpace(outputDirectory))
+            {
+                ShowError("Le dossier de sortie est requis.", "Champ manquant");
+                return;
+            }
+
             SetBusyState(true);
 
             try
@@ -294,11 +319,24 @@ namespace codemergeWinForms
                 var repositoryService = CreateRepositoryService(token);
                 var functionExtract = new FunctionExtractService();
                 var exporter = new MarkdownExportService(repositoryService, functionExtract);
-                var (fileName, markdown) = await exporter.BuildProjectExportAsync(projectId, branch, selectedFiles, DateTime.Now);
-                var fullPath = GetOutputPath(fileName);
+                Directory.CreateDirectory(outputDirectory);
 
-                File.WriteAllText(fullPath, markdown, new UTF8Encoding(false));
-                AddExportResult(fullPath);
+                var (packageDirectoryPath, _) = await exporter.ExportProjectAsync(
+                    projectId,
+                    branch,
+                    selectedFiles,
+                    outputDirectory,
+                    DateTime.Now);
+
+                string? zipPath = null;
+
+                if (chkCreateZip.Checked)
+                    zipPath = CreateZipArchive(packageDirectoryPath, outputDirectory);
+
+                if (!string.IsNullOrWhiteSpace(zipPath))
+                    AddExportResult(zipPath);
+
+                AddExportResult(packageDirectoryPath);
             }
             catch (ArgumentException ex)
             {
@@ -750,9 +788,10 @@ namespace codemergeWinForms
         {
             try
             {
-                SaveSessionValue("lastToken.txt", tbxToken.Text);
-                SaveSessionValue("lastId.txt", tbxId.Text);
-                SaveSessionValue("lastBranch.txt", cbxBranch.Text);
+                SaveProtectedSessionValue(LastTokenFileName, tbxToken.Text);
+                SaveSessionValue(LastProjectIdFileName, tbxId.Text);
+                SaveSessionValue(LastBranchFileName, cbxBranch.Text);
+                SaveSessionValue(LastOutputDirectoryFileName, tbxOutputDirectory.Text);
             }
             catch (Exception ex)
             {
@@ -764,9 +803,14 @@ namespace codemergeWinForms
         {
             try
             {
-                LoadSessionValueIfAvailable("lastToken.txt", value => tbxToken.Text = value);
-                LoadSessionValueIfAvailable("lastId.txt", value => tbxId.Text = value);
-                LoadSessionValueIfAvailable("lastBranch.txt", value => cbxBranch.Text = value);
+                tbxOutputDirectory.Text = GetDefaultOutputDirectory();
+                LoadProtectedSessionValueIfAvailable(LastTokenFileName, value => tbxToken.Text = value);
+                LoadSessionValueIfAvailable(LastProjectIdFileName, value => tbxId.Text = value);
+                LoadSessionValueIfAvailable(LastBranchFileName, value => cbxBranch.Text = value);
+                LoadSessionValueIfAvailable(LastOutputDirectoryFileName, value => tbxOutputDirectory.Text = value);
+
+                if (string.IsNullOrWhiteSpace(tbxOutputDirectory.Text))
+                    tbxOutputDirectory.Text = GetDefaultOutputDirectory();
             }
             catch (Exception ex)
             {
@@ -775,11 +819,42 @@ namespace codemergeWinForms
         }
 
         private static void SaveSessionValue(string fileName, string value)
-            => File.WriteAllText(GetOutputPath(fileName), value);
+        {
+            var filePath = GetSessionFilePath(fileName);
+
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                if (File.Exists(filePath))
+                    File.Delete(filePath);
+
+                return;
+            }
+
+            Directory.CreateDirectory(GetSessionDirectoryPath());
+            File.WriteAllText(filePath, value);
+        }
+
+        private static void SaveProtectedSessionValue(string fileName, string value)
+        {
+            var filePath = GetSessionFilePath(fileName);
+
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                if (File.Exists(filePath))
+                    File.Delete(filePath);
+
+                return;
+            }
+
+            Directory.CreateDirectory(GetSessionDirectoryPath());
+            var clearBytes = Encoding.UTF8.GetBytes(value);
+            var protectedBytes = ProtectedData.Protect(clearBytes, null, DataProtectionScope.CurrentUser);
+            File.WriteAllText(filePath, Convert.ToBase64String(protectedBytes));
+        }
 
         private static void LoadSessionValueIfAvailable(string fileName, Action<string> applyValue)
         {
-            var filePath = GetOutputPath(fileName);
+            var filePath = GetSessionFilePath(fileName);
 
             if (!File.Exists(filePath))
                 return;
@@ -790,11 +865,31 @@ namespace codemergeWinForms
                 applyValue(savedValue);
         }
 
+        private static void LoadProtectedSessionValueIfAvailable(string fileName, Action<string> applyValue)
+        {
+            var filePath = GetSessionFilePath(fileName);
+
+            if (!File.Exists(filePath))
+                return;
+
+            var savedValue = File.ReadAllText(filePath).Trim();
+
+            if (string.IsNullOrWhiteSpace(savedValue))
+                return;
+
+            var protectedBytes = Convert.FromBase64String(savedValue);
+            var clearBytes = ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser);
+            var clearText = Encoding.UTF8.GetString(clearBytes).Trim();
+
+            if (!string.IsNullOrWhiteSpace(clearText))
+                applyValue(clearText);
+        }
+
         private void ConfigureExportResultsList()
         {
             _exportResultMenu = new ContextMenuStrip();
-            _exportResultMenu.Items.Add("Ouvrir le fichier", null, (_, _) => TryOpenSelectedExport());
-            _exportResultMenu.Items.Add("Ouvrir l'emplacement du fichier", null, (_, _) => TryOpenSelectedExportLocation());
+            _exportResultMenu.Items.Add("Ouvrir", null, (_, _) => TryOpenSelectedExport());
+            _exportResultMenu.Items.Add("Ouvrir l'emplacement", null, (_, _) => TryOpenSelectedExportLocation());
 
             listBox1.DrawMode = DrawMode.OwnerDrawFixed;
             listBox1.DrawItem += listBox1_DrawItem;
@@ -826,7 +921,7 @@ namespace codemergeWinForms
                 return;
 
             var isSelected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
-            var fileExists = File.Exists(item.FilePath);
+            var fileExists = File.Exists(item.FilePath) || Directory.Exists(item.FilePath);
             var textColor = isSelected
                 ? SystemColors.HighlightText
                 : fileExists
@@ -851,7 +946,7 @@ namespace codemergeWinForms
         private void listBox1_MouseMove(object? sender, MouseEventArgs e)
         {
             var item = GetExportResultAt(e.Location);
-            listBox1.Cursor = item is not null && File.Exists(item.FilePath)
+            listBox1.Cursor = item is not null && (File.Exists(item.FilePath) || Directory.Exists(item.FilePath))
                 ? Cursors.Hand
                 : Cursors.Default;
         }
@@ -925,7 +1020,7 @@ namespace codemergeWinForms
             if (item is null)
                 return;
 
-            if (!EnsureExportFileExists(item))
+            if (!EnsureExportPathExists(item))
                 return;
 
             try
@@ -953,10 +1048,21 @@ namespace codemergeWinForms
                 return;
 
             var fileExists = File.Exists(item.FilePath);
+            var directoryExists = Directory.Exists(item.FilePath);
             var directory = Path.GetDirectoryName(item.FilePath);
 
             try
             {
+                if (directoryExists)
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = item.FilePath,
+                        UseShellExecute = true
+                    });
+                    return;
+                }
+
                 if (fileExists)
                 {
                     Process.Start(new ProcessStartInfo
@@ -991,25 +1097,25 @@ namespace codemergeWinForms
             }
         }
 
-        private bool EnsureExportFileExists(ExportResultItem item)
+        private bool EnsureExportPathExists(ExportResultItem item)
         {
-            if (File.Exists(item.FilePath))
+            if (File.Exists(item.FilePath) || Directory.Exists(item.FilePath))
                 return true;
 
             ShowError(
-                $"Le fichier n'existe plus a cet emplacement :\n{item.FilePath}",
-                "Fichier introuvable");
+                $"L'element n'existe plus a cet emplacement :\n{item.FilePath}",
+                "Element introuvable");
 
             return false;
         }
 
-        private static string GetOutputPath(string fileName)
-            => Path.GetFullPath(fileName);
-
         private void SetBusyState(bool isBusy)
         {
+            cbxTypeGit.Enabled = !isBusy;
             btnBranch.Enabled = !isBusy;
             btnTree.Enabled = !isBusy;
+            btnChooseOutputDirectory.Enabled = !isBusy;
+            chkCreateZip.Enabled = !isBusy;
 
             if (isBusy)
             {
@@ -1017,6 +1123,101 @@ namespace codemergeWinForms
                 return;
             }
             btnMarkdown.Enabled = HasAnySelectableFileNodes(trvTree.Nodes);
+        }
+
+        private void btnChooseOutputDirectory_Click(object sender, EventArgs e)
+        {
+            using var dialog = new FolderBrowserDialog
+            {
+                Description = "Choisir le dossier de sortie",
+                SelectedPath = GetSelectedOutputDirectory(),
+                ShowNewFolderButton = true
+            };
+
+            if (dialog.ShowDialog(this) == DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.SelectedPath))
+                tbxOutputDirectory.Text = dialog.SelectedPath;
+        }
+
+        private static string GetSessionDirectoryPath()
+            => Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                ApplicationDataFolderName);
+
+        private static string GetSessionFilePath(string fileName)
+            => Path.Combine(GetSessionDirectoryPath(), fileName);
+
+        private string GetSelectedOutputDirectory()
+            => string.IsNullOrWhiteSpace(tbxOutputDirectory.Text)
+                ? GetDefaultOutputDirectory()
+                : tbxOutputDirectory.Text.Trim();
+
+        private static string GetDefaultOutputDirectory()
+        {
+            var downloadsPath = TryGetKnownFolderPath(DownloadsFolderId);
+
+            if (!string.IsNullOrWhiteSpace(downloadsPath))
+                return downloadsPath;
+
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            return Path.Combine(userProfile, "Downloads");
+        }
+
+        private static string? TryGetKnownFolderPath(Guid knownFolderId)
+        {
+            try
+            {
+                if (SHGetKnownFolderPath(knownFolderId, 0, 0, out var pathPointer) != 0 || pathPointer == 0)
+                    return null;
+
+                try
+                {
+                    return Marshal.PtrToStringUni(pathPointer);
+                }
+                finally
+                {
+                    Marshal.FreeCoTaskMem(pathPointer);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string CreateZipArchive(string packageDirectoryPath, string outputDirectory)
+        {
+            var zipFileName = $"{Path.GetFileName(packageDirectoryPath)}.zip";
+            var zipFilePath = GetUniqueFilePath(outputDirectory, zipFileName);
+
+            ZipFile.CreateFromDirectory(
+                packageDirectoryPath,
+                zipFilePath,
+                CompressionLevel.Optimal,
+                includeBaseDirectory: true);
+
+            return zipFilePath;
+        }
+
+        private static string GetUniqueFilePath(string directory, string fileName)
+        {
+            var baseFileName = Path.GetFileNameWithoutExtension(fileName);
+            var extension = Path.GetExtension(fileName);
+            var candidate = Path.Combine(directory, fileName);
+
+            if (!File.Exists(candidate))
+                return candidate;
+
+            var suffix = 2;
+
+            while (true)
+            {
+                candidate = Path.Combine(directory, $"{baseFileName} ({suffix}){extension}");
+
+                if (!File.Exists(candidate))
+                    return candidate;
+
+                suffix++;
+            }
         }
 
         private static bool HasAnySelectableFileNodes(TreeNodeCollection nodes)
@@ -1067,7 +1268,7 @@ namespace codemergeWinForms
                     "error.log",
                     $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}]{Environment.NewLine}{ex}{Environment.NewLine}{Environment.NewLine}");
             }
-            catch {}
+            catch { }
         }
 
         private void button1_Click(object sender, EventArgs e)
